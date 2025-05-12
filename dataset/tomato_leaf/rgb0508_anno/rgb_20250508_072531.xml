@@ -1,7 +1,7 @@
-<annotation verified="yes">
+<annotation verified="no">
   <folder>rgb0508_anno</folder>
   <filename>rgb_20250508_072531</filename>
-  <path>/home/ihpc/code/yolo/tomato_leaf/rgb0508_anno/rgb_20250508_072531.png</path>
+  <path>/home/ihpc/code/yolo/yolo-obb-depth/dataset/tomato_leaf/rgb0508_anno/rgb_20250508_072531.png</path>
   <source>
     <database>Unknown</database>
   </source>
