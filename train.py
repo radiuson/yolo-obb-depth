@@ -233,8 +233,6 @@ if __name__ == "__main__":
     image_dir="/home/ihpc/code/yolo/yolo-obb-depth/dataset/nyudepthv2/nyu_preprocessed/nyu_rgb"
     label_dir="/home/ihpc/code/yolo/yolo-obb-depth/dataset/nyudepthv2/nyu_preprocessed/dummy_label"
     depth_dir="/home/ihpc/code/yolo/yolo-obb-depth/dataset/nyudepthv2/nyu_preprocessed/nyu_depth"
-    x = torch.randn(16, 3, 640, 640)
-    det,depth = model(x)
     model.train()
     train(image_dir, label_dir, depth_dir,nc=3)
 
