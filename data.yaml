@@ -1,0 +1,7 @@
+train: dataset/tomato_leaf_split/images/train
+val: dataset/tomato_leaf_split/images/val
+test: dataset/tomato_leaf_split/images/test  # 如果 test_ratio > 0
+
+nc: 2
+names: [ 'tomato', 'leaf' ]
+obb: true
