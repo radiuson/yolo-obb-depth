@@ -135,32 +135,6 @@ class Detect(nn.Module):
         y = self._inference(x)
         return y if self.export else (y, x)
 
-    def forward_end2end(self, x):
-        """
-        Performs forward pass of the v10Detect module.
-
-        Args:
-            x (List[torch.Tensor]): Input feature maps from different levels.
-
-        Returns:
-            (dict | tuple):
-
-                - If in training mode, returns a dictionary containing outputs of both one2many and one2one detections.
-                - If not in training mode, returns processed detections or a tuple with processed detections and raw outputs.
-        """
-        x_detach = [xi.detach() for xi in x]
-        one2one = [
-            torch.cat((self.one2one_cv2[i](x_detach[i]), self.one2one_cv3[i](x_detach[i])), 1) for i in range(self.nl)
-        ]
-        for i in range(self.nl):
-            x[i] = torch.cat((self.cv2[i](x[i]), self.cv3[i](x[i])), 1)
-        if self.training:  # Training path
-            return {"one2many": x, "one2one": one2one}
-
-        y = self._inference(one2one)
-        y = self.postprocess(y.permute(0, 2, 1), self.max_det, self.nc)
-        return y if self.export else (y, {"one2many": x, "one2one": one2one})
-
     def _inference(self, x):
         """
         Decode predicted bounding boxes and class probabilities based on multiple-level feature maps.
@@ -174,31 +148,10 @@ class Detect(nn.Module):
         # Inference path
         shape = x[0].shape  # BCHW
         x_cat = torch.cat([xi.view(shape[0], self.no, -1) for xi in x], 2)
-        if self.format != "imx" and (self.dynamic or self.shape != shape):
-            self.anchors, self.strides = (x.transpose(0, 1) for x in make_anchors(x, self.stride, 0.5))
-            self.shape = shape
-
-        if self.export and self.format in {"saved_model", "pb", "tflite", "edgetpu", "tfjs"}:  # avoid TF FlexSplitV ops
-            box = x_cat[:, : self.reg_max * 4]
-            cls = x_cat[:, self.reg_max * 4 :]
-        else:
-            box, cls = x_cat.split((self.reg_max * 4, self.nc), 1)
-
-        if self.export and self.format in {"tflite", "edgetpu"}:
-            # Precompute normalization factor to increase numerical stability
-            # See https://github.com/ultralytics/ultralytics/issues/7371
-            grid_h = shape[2]
-            grid_w = shape[3]
-            grid_size = torch.tensor([grid_w, grid_h, grid_w, grid_h], device=box.device).reshape(1, 4, 1)
-            norm = self.strides / (self.stride[0] * grid_size)
-            dbox = self.decode_bboxes(self.dfl(box) * norm, self.anchors.unsqueeze(0) * norm[:, :2])
-        elif self.export and self.format == "imx":
-            dbox = self.decode_bboxes(
-                self.dfl(box) * self.strides, self.anchors.unsqueeze(0) * self.strides, xywh=False
-            )
-            return dbox.transpose(1, 2), cls.sigmoid().permute(0, 2, 1)
-        else:
-            dbox = self.decode_bboxes(self.dfl(box), self.anchors.unsqueeze(0)) * self.strides
+        self.anchors, self.strides = (x.transpose(0, 1) for x in make_anchors(x, self.stride, 0.5))
+        self.shape = shape
+        box, cls = x_cat.split((self.reg_max * 4, self.nc), 1)
+        dbox = self.decode_bboxes(self.dfl(box), self.anchors.unsqueeze(0)) * self.strides
 
         return torch.cat((dbox, cls.sigmoid()), 1)
 
@@ -261,6 +214,7 @@ class OBB(Detect):
 
         """Concatenates and returns predicted bounding boxes and class probabilities."""
         bs = x[0].shape[0]  # batch size
+        
         angle = torch.cat([self.cv4[i](x[i]).view(bs, self.ne, -1) for i in range(self.nl)], 2)  # OBB theta logits
         # NOTE: set `angle` as an attribute so that `decode_bboxes` could use it.
         angle = (angle.sigmoid() - 0.25) * math.pi  # [-pi/4, 3pi/4]
@@ -308,34 +262,32 @@ class YOLOv8OBBDepthModel(nn.Module):
         det_out = self.head([h3, h4, h5])   # (preds, (raw_x, angle))
         depth_out = self.depth([h3, h4, h5])
         return det_out, depth_out
-
-from ultralytics.nn.tasks import BaseModel
-
-class DetectionModelWithDepth(BaseModel):
-    def __init__(self, cfg=None, ch=3, nc=80, verbose=True):
-        super().__init__()
-        self.model = YOLOv8OBBDepthModel(nc=nc)
-        self.save = []
-        self.names = {i: f"{i}" for i in range(nc)}
-        self.inplace = True
-
-    def forward(self, x):
-        return self.model(x)
-
-
+    
+def analyze_structure(var, name="var", indent=0):
+    """递归分析变量结构（支持 Tensor、list、tuple、dict 等）"""
+    prefix = " " * indent
+    if isinstance(var, torch.Tensor):
+        print(f"{prefix}{name}: Tensor | shape={tuple(var.shape)} | dtype={var.dtype} | device={var.device}")
+    elif isinstance(var, (list, tuple)):
+        print(f"{prefix}{name}: {type(var).__name__} | len={len(var)}")
+        for i, item in enumerate(var):
+            analyze_structure(item, name=f"[{i}]", indent=indent + 2)
+    elif isinstance(var, dict):
+        print(f"{prefix}{name}: dict | keys={list(var.keys())}")
+        for k, v in var.items():
+            analyze_structure(v, name=f'["{k}"]', indent=indent + 2)
+    else:
+        print(f"{prefix}{name}: {type(var).__name__} | value={var}")
 if __name__ == "__main__":
-    backbone = YOLOv8OBBDepth_backbone()
+    model = YOLOv8OBBDepthModel(nc=2)
     x = torch.randn(16, 3, 640, 640)
-    p3,p4,p5 = backbone(x)
-    
-    neck = YOLOv8OBBDepth_neck([make_divisible(256*W,8), make_divisible(512*W,8), make_divisible(1024*W,8)])
-    h3, h4, h5 = neck(p3, p4, p5)
-
-    head = OBB(nc=80,ch = [make_divisible(256*W,8), make_divisible(512*W,8), make_divisible(1024*W,8)])
-    result = head([h3, h4, h5])
-
-    depth = Depth(ch = [make_divisible(256*W,8), make_divisible(512*W,8), make_divisible(1024*W,8)])
-    depth_result = depth([h3, h4, h5])
-    # print("Detection Output Shape:", result[0][0].shape)
-
-    
+    model.eval()
+    with torch.no_grad():
+        obb,depth = model(x)
+        analyze_structure(obb, name="OBB Output")
+        analyze_structure(depth, name="Depth Output")
+    model.train()
+    with torch.no_grad():
+        obb,depth = model(x)
+        analyze_structure(obb, name="OBB Output")
+        analyze_structure(depth, name="Depth Output")

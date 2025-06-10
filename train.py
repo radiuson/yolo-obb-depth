@@ -1,12 +1,15 @@
 import torch
+import torch.nn as nn
 import numpy as np
 import random
 import torch.optim as optim
+import datetime 
 
+from loss import scale_invariant_loss, batch_obb_loss_fn, xyxyxyxy2xywhr, BboxLoss
+from taskal import RotatedTaskAlignedAssigner, make_anchors
 
 from model import YOLOv8OBBDepthModel
 import os
-import torch
 import numpy as np
 from PIL import Image
 from pathlib import Path
@@ -15,21 +18,22 @@ import cv2
 from torch.utils.data import DataLoader
 import torch.nn.functional as F
 
-def scale_invariant_loss(pred, target, valid_mask=None):
-    """
-    pred, target: (B, 1, H, W)
-    valid_mask: (B, 1, H, W) or None
-    """
-    if valid_mask is not None:
-        pred = pred[valid_mask]
-        target = target[valid_mask]
 
-    diff = pred - target
-    diff2 = diff ** 2
-    first_term = diff2.mean()
-    second_term = 0.5 * (diff.sum() ** 2) / (diff.numel() ** 2)
-    return first_term - second_term
-
+def analyze_structure(var, name="var", indent=0):
+    """递归分析变量结构（支持 Tensor、list、tuple、dict 等）"""
+    prefix = " " * indent
+    if isinstance(var, torch.Tensor):
+        print(f"{prefix}{name}: Tensor | shape={tuple(var.shape)} | dtype={var.dtype} | device={var.device}")
+    elif isinstance(var, (list, tuple)):
+        print(f"{prefix}{name}: {type(var).__name__} | len={len(var)}")
+        for i, item in enumerate(var):
+            analyze_structure(item, name=f"[{i}]", indent=indent + 2)
+    elif isinstance(var, dict):
+        print(f"{prefix}{name}: dict | keys={list(var.keys())}")
+        for k, v in var.items():
+            analyze_structure(v, name=f'["{k}"]', indent=indent + 2)
+    else:
+        print(f"{prefix}{name}: {type(var).__name__} | value={var}")
 
 class OBBDepthDataset(torch.utils.data.Dataset):
     def __init__(self, image_dir, label_dir, depth_dir, img_size=640):
@@ -94,63 +98,6 @@ class OBBDepthDataset(torch.utils.data.Dataset):
         }
     
 
-def train(image_dir, label_dir, depth_dir,nc=2):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    # 模型
-    model = YOLOv8OBBDepthModel(nc=nc).to(device)
-    model.train()
-
-    # 优化器
-    optimizer = optim.AdamW(model.parameters(), lr=1e-2)
-
-    # 数据集
-    train_dataset = OBBDepthDataset(
-        image_dir=image_dir,
-        label_dir=label_dir,
-        depth_dir=depth_dir
-    )
-    train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True, num_workers=4,collate_fn=custom_collate_fn)
-
-    # 开始训练
-    num_epochs = 1000
-    for epoch in range(num_epochs):
-        total_depth_loss = 0.0
-        for batch in train_loader:
-            model.train()
-            imgs = batch["img"].to(device)              # (B, 3, 640, 640)
-            depths_gt = [d.to(device) for d in batch["depth"]]  # [(B,1,80,80), ...]
-
-            optimizer.zero_grad()
-            _, depth_preds = model(imgs)  # depth_preds: list of 3 tensors
-
-            # 计算多尺度 Scale-Invariant Loss
-            loss = 0
-            for pred, gt in zip(depth_preds, depths_gt):
-                loss += scale_invariant_loss(pred, gt)
-            loss.backward()
-            optimizer.step()
-
-            total_depth_loss += loss.item()
-
-        print(f"[Epoch {epoch+1}] Depth Loss: {total_depth_loss:.4f}")
-
-        val_loader = get_val_loader_from_train(train_dataset, num_samples=10, batch_size=1)
-        model.eval()
-        with torch.no_grad():
-            total_rmse = 0.0
-            for batch in val_loader:
-                img = batch["img"].to(device)
-                gt_depths = [d.to(device) for d in batch["depth"]]
-                _, pred_depths = model(img)
-                depth_pred_80 = pred_depths[0]  # 只取模型输出中的 80x80 输出
-
-                rmse_vals = compute_rmse(depth_pred_80, gt_depths)
-                total_rmse += np.mean(rmse_vals)
-        print(f"[Epoch {epoch+1}] Validation RMSE: {total_rmse/len(val_loader):.4f}")
-    # 保存模型
-        torch.save(model.state_dict(), "obb_depth_model.pth")
-
 def compute_rmse(pred_depths, gt_depths):
     """
     计算每个尺度下的 RMSE（Root Mean Squared Error）。
@@ -173,29 +120,60 @@ def compute_rmse(pred_depths, gt_depths):
             rmse_list.append(float("nan"))
             continue
 
-        mse = torch.mean((pred - gt) ** 2)
+        mse = torch.mean((pred/1000 - gt/1000) ** 2)
         rmse = torch.sqrt(mse).item()
         rmse_list.append(rmse)
 
     return rmse_list
 
-def custom_collate_fn(batch):
-    imgs = torch.stack([b["img"] for b in batch])
-    labels = [b["label"] for b in batch]  # 保持为 list of tensors
-    depths = [b["depth"] for b in batch]  # list of list (3 tensors)
+
+def custom_collate_fn_rotated_depth(batch, img_size=(640, 640), max_gt=60):
+    imgs = torch.stack([b["img"] for b in batch])               # [B, 3, H, W]
+    labels_raw = [b["label"] for b in batch]                    # list of [N, 9]
+    depths = [b["depth"] for b in batch]                        # list of list(3)
     names = [b["name"] for b in batch]
+
+    B = len(batch)
+    gt_labels = torch.zeros((B, max_gt, 1), dtype=torch.long)
+    gt_bboxes = torch.zeros((B, max_gt, 5), dtype=torch.float32)
+    mask_gt = torch.zeros((B, max_gt, 1), dtype=torch.bool)
+    batch_idx_list = []
+    cls_list = []
+    rboxes_list = []
     
-    # 深度图 [B, 1, H, W] * 3
+    for i, labels in enumerate(labels_raw):
+        
+        if len(labels) == 0:
+            continue
+        labels = np.array(list(labels), dtype=np.float32)
+        classes = labels[:, 0]
+    
+        rboxes = torch.tensor(xyxyxyxy2xywhr(labels[:, 1:9]), dtype=torch.float32) # 转为 [cx, cy, w, h, theta] 格式
+
+        batch_idx_list.extend([i] * len(classes))
+        n = min(len(classes), max_gt)
+        gt_labels[i, :n, 0] = torch.tensor(classes[:n], dtype=torch.long)
+        gt_bboxes[i, :n] = rboxes[:n]
+        mask_gt[i, :n, 0] = 1
+    batch_idx_list = torch.tensor(batch_idx_list, dtype=torch.long)  # [N,]
+    # 深度图 3 级尺度：list of [B, 1, H, W]
     depths_80 = torch.stack([d[0] for d in depths])
     depths_40 = torch.stack([d[1] for d in depths])
     depths_20 = torch.stack([d[2] for d in depths])
 
     return {
         "img": imgs,
-        "label": labels,
+        "batch_idx": batch_idx_list,
+        "label": labels_raw,
         "depth": [depths_80, depths_40, depths_20],
         "name": names,
+        "gt_labels": gt_labels,
+        "gt_bboxes": gt_bboxes,
+        "mask_gt": mask_gt
     }
+
+
+
 from torch.utils.data import Subset, DataLoader
 import random
 
@@ -218,22 +196,142 @@ def get_val_loader_from_train(train_dataset, num_samples=10, batch_size=1, seed=
     val_loader = DataLoader(val_subset, batch_size=batch_size, shuffle=False)
     return val_loader
 
+
+
+
+def train(image_dir, label_dir, depth_dir, nc=2, save_name=None, weight_path=None):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    reg_max = 16
+    # 自动生成模型保存名
+    if save_name is None:
+        now = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        save_name = f"obb_depth_{now}.pth"
+
+    # 模型
+    model = YOLOv8OBBDepthModel(nc=nc).to(device)
+    if weight_path is not None:
+        model.load_state_dict(torch.load(weight_path, map_location=device))
+
+    # 优化器
+    optimizer = optim.AdamW(model.parameters(), lr=1e-2)
+
+    # 数据集
+    train_dataset = OBBDepthDataset(
+        image_dir=image_dir,
+        label_dir=label_dir,
+        depth_dir=depth_dir
+    )
+    train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True, num_workers=4, collate_fn=custom_collate_fn_rotated_depth)
+
+    # Assigner
+    assigner = RotatedTaskAlignedAssigner(
+        topk=13,
+        num_classes=nc,
+        alpha=1.0,
+        beta=6.0,
+        eps=1e-9,
+    )
+    bce = nn.BCEWithLogitsLoss(reduction="none")
+    bbox_loss = BboxLoss(reg_max).to(device)
+
+    num_epochs = 500
+    for epoch in range(num_epochs):
+        total_loss = 0.0
+        total_det_loss = 0.0
+        total_depth_loss = 0.0
+
+        for batch in train_loader:
+            model.train()
+            imgs = batch["img"].to(device)
+            labels = batch["label"]
+            depths_gt = [d.to(device) for d in batch["depth"]]
+            gt_labels = batch["gt_labels"].to(device)
+            gt_bboxes = batch["gt_bboxes"].to(device)
+            mask_gt = batch["mask_gt"].to(device)
+
+            optimizer.zero_grad()
+            det_out, depth_preds = model(imgs)
+            
+            obb_loss = batch_obb_loss_fn(det_out,batch,device,assigner,bce,bbox_loss)
+
+            # ===== Depth Loss =====
+            depth_loss = sum(scale_invariant_loss(pred, gt, gt > 0) for pred, gt in zip(depth_preds, depths_gt))
+
+            # ===== Backward =====
+            depth_train = False
+            loss = depth_loss + obb_loss
+            loss.backward()
+            optimizer.step()
+
+
+        # ===== 打印 epoch 统计 =====
+        print(f"[Epoch {epoch+1}] Total Loss: {total_loss:.4f} | Detection: {total_det_loss:.4f} | Depth: {total_depth_loss:.4f}")
+        if depth_train is True:
+            # ===== 每轮验证 RMSE（可选）=====
+            val_loader = get_val_loader_from_train(train_dataset, num_samples=1, batch_size=1)
+            model.eval()
+            with torch.no_grad():
+                total_rmse = 0.0
+                for batch in val_loader:
+                    img = batch["img"].to(device)
+                    gt_depths = [d.to(device) for d in batch["depth"]]
+                    _, pred_depths = model(img)
+                    depth_pred_80 = pred_depths[0]
+                    rmse_vals = compute_rmse(depth_pred_80, gt_depths)
+                    total_rmse += np.mean(rmse_vals)
+            print(f"[Epoch {epoch+1}] Validation RMSE: {total_rmse/len(val_loader):.4f}")
+
+        # ===== 保存模型 =====
+        torch.save(model.state_dict(), save_name)
+
+    def analyze_structure(var, name="var", indent=0):
+            """递归分析变量结构（支持 Tensor、list、tuple、dict 等）"""
+            prefix = " " * indent
+            if isinstance(var, torch.Tensor):
+                print(f"{prefix}{name}: Tensor | shape={tuple(var.shape)} | dtype={var.dtype} | device={var.device}")
+            elif isinstance(var, (list, tuple)):
+                print(f"{prefix}{name}: {type(var).__name__} | len={len(var)}")
+                for i, item in enumerate(var):
+                    analyze_structure(item, name=f"[{i}]", indent=indent + 2)
+            elif isinstance(var, dict):
+                print(f"{prefix}{name}: dict | keys={list(var.keys())}")
+                for k, v in var.items():
+                    analyze_structure(v, name=f'["{k}"]', indent=indent + 2)
+            else:
+                print(f"{prefix}{name}: {type(var).__name__} | value={var}")
 if __name__ == "__main__":
-    model = YOLOv8OBBDepthModel(nc=3) 
+    model = YOLOv8OBBDepthModel(nc=2) 
     
     # tomato leaf 数据集路径
-    # image_dir="/home/ihpc/code/yolo/yolo-obb-depth/dataset/tomato_leaf_split/train/images"
-    # label_dir="/home/ihpc/code/yolo/yolo-obb-depth/dataset/tomato_leaf_split/train/labels"
-    # depth_dir="/home/ihpc/code/yolo/yolo-obb-depth/dataset/tomato_leaf_split/train/depth"
-    # x = torch.randn(16, 3, 640, 640)
-    # det,depth = model(x)
-    # model.train()
-    # train(image_dir, label_dir, depth_dir,nc=3)
+    image_dir="/home/ihpc/code/yolo/yolo-obb-depth/dataset/tomato_leaf_split/train/images"
+    label_dir="/home/ihpc/code/yolo/yolo-obb-depth/dataset/tomato_leaf_split/train/labels"
+    depth_dir="/home/ihpc/code/yolo/yolo-obb-depth/dataset/tomato_leaf_split/train/depth"
+    # train_dataset = OBBDepthDataset(
+    #         image_dir=image_dir,
+    #         label_dir=label_dir,
+    #         depth_dir=depth_dir
+    #     )
 
-    image_dir="/home/ihpc/code/yolo/yolo-obb-depth/dataset/nyudepthv2/nyu_preprocessed/nyu_rgb"
-    label_dir="/home/ihpc/code/yolo/yolo-obb-depth/dataset/nyudepthv2/nyu_preprocessed/dummy_label"
-    depth_dir="/home/ihpc/code/yolo/yolo-obb-depth/dataset/nyudepthv2/nyu_preprocessed/nyu_depth"
+
+    # train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True, num_workers=4, collate_fn=custom_collate_fn_rotated_depth)
+    # train_iter = iter(train_loader)
+    # batch = next(train_iter)
+    
     model.train()
-    train(image_dir, label_dir, depth_dir,nc=3)
+    train(image_dir, label_dir, depth_dir,nc=2, save_name="yolo_obb_depth_tomato_leaf.pth")
+
+    # NYU Depth V2 数据集路径
+    # image_dir="/home/ihpc/code/yolo/yolo-obb-depth/dataset/nyudepthv2/nyu_preprocessed/nyu_rgb"
+    # label_dir="/home/ihpc/code/yolo/yolo-obb-depth/dataset/nyudepthv2/nyu_preprocessed/dummy_label"
+    # depth_dir="/home/ihpc/code/yolo/yolo-obb-depth/dataset/nyudepthv2/nyu_preprocessed/nyu_depth"
+    
+    # DOTA8 数据集路径
+    # image_dir="/home/ihpc/code/yolo/datasets/dota8/images"
+    # label_dir="/home/ihpc/code/yolo/datasets/dota8/labels"
+    # depth_dir="/home/ihpc/code/yolo/datasets/dota8/depth"
+        
+    
+    # model.train()
+    # train(image_dir, label_dir, depth_dir,nc=2, save_name="tomato_leaf.pth")
 
 
